@@ -6,8 +6,21 @@
 // starts. The process leaves when GET /work reports the trial is done.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { isRecord, readBrief, type Brief, type Json } from "./lib/brief.ts";
+import { freeModels, isRecord, readBrief, type Brief, type Json } from "./lib/brief.ts";
 import { anthropicModelList, buildCatalog, listedModels, openAIModelList, type Catalog } from "./lib/catalog.ts";
+import { needFor, rankModels } from "./lib/rank.ts";
+import {
+  anthropicJson,
+  anthropicSse,
+  anthropicToChat,
+  chatBody,
+  declaredTools,
+  openAIJson,
+  openAISse,
+  parseUpstream,
+  present,
+  tokensOf,
+} from "./lib/translate.ts";
 
 const PROTOCOL_VERSION = 1;
 const POLL_MS = 100;
@@ -15,12 +28,24 @@ const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? "").replace(/\/+$/, "");
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? "";
+const GATEWAY_URL = (process.env.OPENAI_BASE_URL ?? "").replace(/\/+$/, "");
+const GATEWAY_KEY = process.env.OPENAI_API_KEY ?? "";
 
 const brief: Brief = readBrief(PROMPT_FILE);
 const catalog: Catalog = buildCatalog(brief);
+/** Prompts arrive in brief order. The cursor advances once per completion body. */
+let promptCursor = 0;
+/** Models that answered 429. Later prompts skip them; there is no retry-after. */
+const cooled = new Set<string>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
+}
+
+/** Chat Completions on the gateway. A base that already ends in `/v1` is not doubled. */
+function chatCompletionsUrl(): string {
+  if (GATEWAY_URL === "") return "";
+  return GATEWAY_URL.endsWith("/v1") ? `${GATEWAY_URL}/chat/completions` : `${GATEWAY_URL}/v1/chat/completions`;
 }
 
 function catalogBytes(): string {
@@ -72,12 +97,59 @@ function serveModels(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(models));
 }
 
+async function dial(modelId: string, body: Json): Promise<Response> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    authorization: `Bearer ${GATEWAY_KEY}`,
+  };
+  if (body.stream === true) headers.accept = "text/event-stream";
+  return fetch(chatCompletionsUrl(), { method: "POST", headers, body: JSON.stringify(body) });
+}
+
 /**
- * Completions are filled in once routing is wired. Until then the route exists
- * and answers in the caller's wire, so a client can tell the server is up.
+ * One completion. The highest-rated free model that meets the prompt is dialled
+ * on Chat Completions. Its answer is returned on the wire the client used, with
+ * the dialled id restored on `model`.
  */
-function serveNotRouted(res: ServerResponse, wire: "openai" | "anthropic"): void {
-  sendError(res, wire, 503, wire === "anthropic" ? "overloaded_error" : "server_error", "no free model is selected for this request");
+async function serveCompletion(res: ServerResponse, wire: "openai" | "anthropic", body: Json): Promise<void> {
+  const row = brief.prompts[promptCursor];
+  promptCursor += 1;
+  const need = needFor(row, body);
+  const chosen = rankModels(freeModels(brief), need, cooled)[0];
+  if (chosen === undefined) {
+    sendError(res, wire, 503, wire === "anthropic" ? "overloaded_error" : "server_error", "no free model meets this request");
+    return;
+  }
+  const upstreamBody = wire === "anthropic" ? anthropicToChat(body, chosen.id) : chatBody(body, chosen.id);
+  let upstream: Response;
+  try {
+    upstream = await dial(chosen.id, upstreamBody);
+  } catch (err) {
+    sendError(res, wire, 502, wire === "anthropic" ? "api_error" : "upstream_error", (err as Error).message);
+    return;
+  }
+  const text = await upstream.text();
+  if (!upstream.ok) {
+    sendError(res, wire, 502, wire === "anthropic" ? "api_error" : "upstream_error", `the gateway answered HTTP ${upstream.status}`);
+    return;
+  }
+  const parsed = parseUpstream(text, body.stream === true);
+  if (parsed === null) {
+    sendError(res, wire, 502, wire === "anthropic" ? "api_error" : "upstream_error", "the gateway answer was not a completion");
+    return;
+  }
+  const shown = present(parsed, tokensOf(body), need.json, declaredTools(body, wire));
+  if (body.stream === true) {
+    const payload = wire === "anthropic" ? anthropicSse(chosen.id, shown) : openAISse(chosen.id, shown);
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    res.end(payload);
+    return;
+  }
+  sendJson(res, 200, wire === "anthropic" ? anthropicJson(chosen.id, shown) : openAIJson(chosen.id, shown));
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -94,7 +166,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendError(res, wire, 400, "invalid_request_error", "the request body is not one JSON object");
       return;
     }
-    serveNotRouted(res, wire);
+    await serveCompletion(res, wire, body);
     return;
   }
   sendError(res, wireOf(req, pathname), 404, "not_found", `no route for ${req.method ?? "GET"} ${pathname}`);
@@ -166,6 +238,7 @@ async function main(): Promise<void> {
     process.exit(0);
   }
   if (ENV_URL === "") throw new Error("MAKEFUN_ENV_URL is not set");
+  if (chatCompletionsUrl() === "") throw new Error("OPENAI_BASE_URL is not set");
   const server = createServer((req, res) => {
     void handle(req, res).catch((err: unknown) => {
       log((err as Error).stack ?? String(err));
