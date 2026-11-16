@@ -2,8 +2,10 @@
 //
 // Listens on an ephemeral port, registers the OpenRouter catalog, and answers
 // OpenAI and Anthropic completion routes with a real free model dialled through
-// the grader's gateway. `--list` prints that catalog and exits before the server
-// starts. The process leaves when GET /work reports the trial is done.
+// the grader's gateway. Each prompt goes to the highest-rated free model that
+// meets its flags. A 4xx/5xx fails over to the next model; a 429 retires that
+// model for the rest of the trial. `--list` prints the catalog and exits before
+// the server starts. The process leaves when GET /work reports the trial is done.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { freeModels, isRecord, readBrief, type Brief, type Json } from "./lib/brief.ts";
@@ -14,12 +16,16 @@ import {
   anthropicSse,
   anthropicToChat,
   chatBody,
+  answerCarries,
   declaredTools,
+  failureOf,
   openAIJson,
   openAISse,
   parseUpstream,
   present,
   tokensOf,
+  type Completion,
+  type UpstreamFailure,
 } from "./lib/translate.ts";
 
 const PROTOCOL_VERSION = 1;
@@ -35,8 +41,12 @@ const brief: Brief = readBrief(PROMPT_FILE);
 const catalog: Catalog = buildCatalog(brief);
 /** Prompts arrive in brief order. The cursor advances once per completion body. */
 let promptCursor = 0;
-/** Models that answered 429. Later prompts skip them; there is no retry-after. */
+/** Models that answered 429 or 404. Later prompts skip them; nothing waits on retry-after. */
 const cooled = new Set<string>();
+/** A 401 is the account, not one model. Further dials would only burn the call cap. */
+let authBlocked = false;
+/** Per prompt, so a run of refusals cannot walk into the 60-call cap. */
+const MAX_ATTEMPTS = 6;
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -106,50 +116,109 @@ async function dial(modelId: string, body: Json): Promise<Response> {
   return fetch(chatCompletionsUrl(), { method: "POST", headers, body: JSON.stringify(body) });
 }
 
+function sendAnswer(
+  res: ServerResponse,
+  wire: "openai" | "anthropic",
+  modelId: string,
+  shown: Completion,
+  stream: boolean,
+  failures: readonly UpstreamFailure[],
+): void {
+  const extra: Record<string, string> = {};
+  if (failures.length > 0) extra["x-makefun-upstream-failures"] = JSON.stringify(failures.slice(0, 8));
+  if (stream) {
+    const payload = wire === "anthropic" ? anthropicSse(modelId, shown) : openAISse(modelId, shown);
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+      ...extra,
+    });
+    res.end(payload);
+    return;
+  }
+  const text = JSON.stringify(wire === "anthropic" ? anthropicJson(modelId, shown) : openAIJson(modelId, shown));
+  res.writeHead(200, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(text),
+    ...extra,
+  });
+  res.end(text);
+}
+
 /**
- * One completion. The highest-rated free model that meets the prompt is dialled
- * on Chat Completions. Its answer is returned on the wire the client used, with
- * the dialled id restored on `model`.
+ * Dial the best eligible free model. A 4xx/5xx fails over to the next one and
+ * is reported on `x-makefun-upstream-failures` when a later model serves the
+ * prompt. A 429 or 404 retires that model for the rest of the trial.
  */
 async function serveCompletion(res: ServerResponse, wire: "openai" | "anthropic", body: Json): Promise<void> {
   const row = brief.prompts[promptCursor];
   promptCursor += 1;
   const need = needFor(row, body);
-  const chosen = rankModels(freeModels(brief), need, cooled)[0];
-  if (chosen === undefined) {
+  const ranked = rankModels(freeModels(brief), need, cooled);
+  if (ranked.length === 0 || authBlocked) {
     sendError(res, wire, 503, wire === "anthropic" ? "overloaded_error" : "server_error", "no free model meets this request");
     return;
   }
-  const upstreamBody = wire === "anthropic" ? anthropicToChat(body, chosen.id) : chatBody(body, chosen.id);
-  let upstream: Response;
-  try {
-    upstream = await dial(chosen.id, upstreamBody);
-  } catch (err) {
-    sendError(res, wire, 502, wire === "anthropic" ? "api_error" : "upstream_error", (err as Error).message);
+  const tokens = tokensOf(body);
+  const declared = declaredTools(body, wire);
+  const failures: UpstreamFailure[] = [];
+  const label = row?.id ?? `request-${promptCursor}`;
+  /** The best real answer that did not carry the token. One backup model is enough. */
+  let fallback: { id: string; shown: Completion } | null = null;
+  let weakBudget = 1;
+  let attempts = 0;
+  for (const candidate of ranked) {
+    if (authBlocked || attempts >= MAX_ATTEMPTS) break;
+    attempts += 1;
+    const upstreamBody = wire === "anthropic" ? anthropicToChat(body, candidate.id) : chatBody(body, candidate.id);
+    let upstream: Response;
+    try {
+      upstream = await dial(candidate.id, upstreamBody);
+    } catch (err) {
+      log(`${label} ${candidate.id} unreachable: ${(err as Error).message}`);
+      continue;
+    }
+    const text = await upstream.text();
+    if (!upstream.ok) {
+      const failure = failureOf(upstream.status, text, candidate.id);
+      if (failures.length < 8) failures.push(failure);
+      if (upstream.status === 429 || upstream.status === 404 || failure.code === "model_not_allowed") cooled.add(candidate.id);
+      if (upstream.status === 401) authBlocked = true;
+      log(`${label} ${candidate.id} refused HTTP ${upstream.status} ${failure.code}`);
+      continue;
+    }
+    const parsed = parseUpstream(text, body.stream === true);
+    if (parsed === null) {
+      log(`${label} ${candidate.id} returned no completion`);
+      continue;
+    }
+    const shown = present(parsed, tokens, need.json, declared);
+    if (answerCarries(shown, tokens)) {
+      log(`${label} served by ${candidate.id}`);
+      sendAnswer(res, wire, candidate.id, shown, body.stream === true, failures);
+      return;
+    }
+    if (fallback === null) fallback = { id: candidate.id, shown };
+    if (weakBudget > 0) {
+      weakBudget -= 1;
+      log(`${label} ${candidate.id} omitted the prompt token`);
+      continue;
+    }
+    break;
+  }
+  if (fallback !== null) {
+    log(`${label} served by ${fallback.id} without a confirmed token`);
+    sendAnswer(res, wire, fallback.id, fallback.shown, body.stream === true, []);
     return;
   }
-  const text = await upstream.text();
-  if (!upstream.ok) {
-    sendError(res, wire, 502, wire === "anthropic" ? "api_error" : "upstream_error", `the gateway answered HTTP ${upstream.status}`);
-    return;
-  }
-  const parsed = parseUpstream(text, body.stream === true);
-  if (parsed === null) {
-    sendError(res, wire, 502, wire === "anthropic" ? "api_error" : "upstream_error", "the gateway answer was not a completion");
-    return;
-  }
-  const shown = present(parsed, tokensOf(body), need.json, declaredTools(body, wire));
-  if (body.stream === true) {
-    const payload = wire === "anthropic" ? anthropicSse(chosen.id, shown) : openAISse(chosen.id, shown);
-    res.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    });
-    res.end(payload);
-    return;
-  }
-  sendJson(res, 200, wire === "anthropic" ? anthropicJson(chosen.id, shown) : openAIJson(chosen.id, shown));
+  sendError(
+    res,
+    wire,
+    502,
+    wire === "anthropic" ? "api_error" : "upstream_error",
+    failures.length === 0 ? "the gateway did not answer" : `every eligible model refused the prompt (${failures.length})`,
+  );
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {

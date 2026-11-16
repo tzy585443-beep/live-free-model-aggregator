@@ -628,11 +628,12 @@ export function failureOf(status: number, text: string, model: string | null): U
     if (isRecord(value) && isRecord(value.error)) {
       const err = value.error;
       if (typeof err.code === "string" && err.code !== "") code = err.code;
+      else if (typeof err.code === "number" && Number.isFinite(err.code)) code = String(err.code);
       else if (typeof err.type === "string") code = err.type;
       else if (typeof err.message === "string") code = err.message;
     }
   } catch {
     code = "";
   }
-  return { status, code: code.slice(0, 64), model };
+  return { status, code: code.replace(/[\r\n]/g, "").slice(0, 64), model };
 }
