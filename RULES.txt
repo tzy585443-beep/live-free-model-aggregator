@@ -1,0 +1,426 @@
+The best live free-model aggregator
+
+## What to build
+Write one server in Node 22 (`main.ts`) or Python 3.13 (`main.py`). It is an aggregator: a client points at it, and every completion it answers comes from a real free model it dials through the grader's gateway. It has to:
+- answer `POST /v1/chat/completions` as an OpenAI-compatible server does, and `POST /v1/messages` as an Anthropic-compatible one does, in JSON and in streaming
+- answer `GET /v1/models` in the wire its auth header names: an `Authorization: Bearer` request gets the OpenAI model list, an `x-api-key` request the Anthropic one
+- listen on `0.0.0.0` at a free port it picks (the env owns 8080) and register that port and its catalog with the env at the trial's start (see The trial)
+- answer each prompt the env sends it with a real completion from one of the free models the brief lists, dialled through the gateway on the trial's key, and never with an answer of its own
+- print the catalog document with `node main.ts --list` (or `python3 main.py --list`), byte for byte as it registers it
+- poll `GET $MAKEFUN_ENV_URL/work` and exit 0 when it says done
+
+Every response must be a well-formed answer of its API: the routes and bodies the request's wire expects, the streaming event order, the stop reasons, usage, tool calls and their results, the system prompt, `max_tokens` and JSON mode, each as the request asks. A response that is not does not count as served, and the `model` field it reports must name the model it really dialled: the house scores the model its own record shows answered.
+
+## The trial
+The sandbox sets `MAKEFUN_ENV_URL`, `MAKEFUN_PROMPT_FILE`, `MAKEFUN_TRIAL_SEED`, `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, and the trial's dummy keys `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`. `MAKEFUN_PROMPT_FILE` is the brief: the free model list (each model's gateway id, its published name, the house's rating, its context length and whether it takes tools, images and JSON) and the six prompts' manifest, in the order the env sends them (each prompt's id, wire, streaming, weight and requirements), and these rules in short.
+
+Your server listens on `0.0.0.0` at a free port it picks (the env owns 8080) and registers it: `POST $MAKEFUN_ENV_URL/register` with `{"protocol_version": 1, "port": <port>, "catalog": <the catalog document>}`. The env answers `{"ok": true, "requests": 6}`, the trial's prompt count. Before the prompts it asks your `GET /v1/models` twice, once with each auth header, for the catalog column. The client then sends the six prompts one at a time, three to `/v1/chat/completions` and three to `/v1/messages`: two ask for server-sent events, one on each wire; two carry a JSON-mode `response_format`, both on the OpenAI wire, the only one that has one; one declares tools; three carry a system prompt; and two weigh 2, the two streaming prompts. The six prompts are drawn per trial from the instance's seed: each is a short instruction carrying a unique token, such as `ZEBRA-4721`, never repeated in the trial, and its answer must carry that token back. Each body names `model` as `auto`: replace it with the dialable id of the free model you choose, dial it on the gateway's Chat Completions route (an Anthropic-shaped request translated into a Chat Completions body and the gateway's answer translated back), and return the gateway's answer to the env in the wire the env used, streamed or not as it asked, with its usage and stop reason whole. The provider's own answer names the model without the gateway's `openrouter/` prefix: put back the id you dialled, on every answer and every streamed chunk, because the `model` field you report must be the model you really served the prompt with.
+
+The client waits up to 30 seconds for each answer and keeps at most 2 MiB of it. While it works, `GET $MAKEFUN_ENV_URL/work` answers `{"done": false, "next": "<prompt id>", "pending": <n>}` and, once every prompt has been sent, `{"done": true}`. When it says done your server must exit 0. A process still running when the trial's wall is spent is stopped and scores 0 on every column.
+
+The trial ends when your server exits or after the trial pod's 240 seconds; the pod's 1 CPU, 1,024 MB of memory and 64 processes are its totals, shared with the env. The env then writes its state export, and the scorer scores it beside the trial's own record of every gateway call. A dev grade's time on production, from your submission's receipt to its result, is your server's live run (six real completion calls, a few seconds to the trial's wall), the trial pod's start-up and teardown, and about 10 seconds besides. Every contender's final trial runs twice, live and then replayed: the replay serves the recorded gateway answers back, without a model, and must leave the same state export, byte for byte; the first scored trial, which decides whether an entry goes on, runs once, live. So derive every choice from the brief, the requests and the gateway's answers: no wall clock and no unseeded randomness.
+
+A void is a fault that is never your entry's: the whole trial is void when the platform's machinery fails, and it runs again from the start on the same instance a minute later, at most twice; after a third void it waits for the organisers to run it again.
+
+## The models and your key
+The only models you can dial are OpenRouter's free ones: the gateway's allowlist for this competition is `openrouter/*:free`, the fourteen the brief lists, each named `openrouter/` plus its upstream id. Every one is priced $0. A request naming anything else is refused with HTTP 400 `model_not_allowed`, and a request with no output cap, or one over the cap, is refused too: name `max_tokens` (or `max_completion_tokens`). A trial may make at most 60 model calls; past that the gateway refuses with HTTP 429 `request_cap`.
+
+The gateway dials every free model on Chat Completions: `POST $OPENAI_BASE_URL/chat/completions`, with `model` the dialable id you chose and a Chat Completions body. Your server still answers both client wires; a request that arrives on `/v1/messages` is translated into that Chat Completions body, and the gateway's answer is translated back into the Messages wire. The `POST $ANTHROPIC_BASE_URL/v1/messages` route serves other providers on an entrant's own key; for every id this competition allows the gateway refuses it before it is sent (HTTP 400 `invalid_request_error`), so a request sent there loses its prompt. The trial's dummy key is already in `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`: send it as the vendor's SDK sends it (`Authorization: Bearer ...` or `x-api-key`). The gateway swaps it for your own OpenRouter key, which never enters the sandbox.
+
+A free model is rate-limited: OpenRouter allows 20 free requests a minute and 50 a day on an account that has purchased under 10 credits, and 1,000 a day on one that has purchased 10 or more. A real provider's 429 or 5xx reaches your server as the provider sent it, with its own error body and no `retry-after` header: nothing retries it for you. A refusal is not an answer: retry it on the same model, fail over to another free model that meets the prompt, or give up, and a prompt you give up on scores nothing. A refusal your server recovered from leaves no trace in its answer unless you report it: when a retry or a failover serves a prompt, your response may carry the refusals in the header `x-makefun-upstream-failures`, a JSON array of at most 8 rows, each `{"status": <number>, "code": "<string>", "model": "<id or null>"}`, in the order the calls refused. The header is optional, but it is the only way the failover column can see a refusal your server retried and then served, because the env sees your answers and never the gateway's traffic. When the trial's gateway record is present, a prompt your server answers with a 4xx or 5xx counts as a refusal only if that record holds a refusal too: a 4xx or 5xx with no refused gateway call behind it is not counted, and a header that is missing, malformed, over 8 KiB or longer than 8 rows is read as no trail at all.
+
+Your key is pushed to this competition before you submit, from an OpenRouter account that has purchased at least 10 credits: the free models still cost nothing, and the purchase raises the daily free ceiling from 50 to 1,000 requests. Put `OPENROUTER_API_KEY=<your key>` in a `.env` file and run `makefun secrets push free-model-aggregator-02 --env-file .env` (it reads the value from the file, never from the command line), or add it under Profile > API keys. The key goes to the model gateway alone, never into your sandbox. An entry with no key pushed still runs, but every model call is refused HTTP 401, no prompt is served, and it is not ranked. A day's practice trials and a final's six-prompt trials can pass 50 calls, so an account under 10 credits can run out mid-grade; once the day's quota is gone every free call is refused 429, the gateway relays that refusal as the provider sent it, and the failover column sees it as a real refusal. An entry that stays inside the ceilings serves every prompt; one that runs out loses the prompts it cannot serve until the quota resets at 00:00 UTC. A key of your own that is refused or rate-limited is your entry's: the trial is scored as it ended. Keep the value out of your repository and your transcripts: an entry whose repository holds a value you pushed, in any commit's files or message and in any encoding, is refused (`committed_secret`), and a transcript that holds one is masked before anything of it is stored.
+
+## Scoring
+A trial scores 0 to 100: the weighted sum of five components, each from 0 to 100 and shown as its own column, rounded to an integer, with the `working` flag and the gateway-call count beside them. `working` is 1 when at least one prompt was answered validly by a model the trial's gateway record shows really served it, else 0; a trial stopped at its wall budget scores 0 on every column.
+- quality (60%): for each valid prompt, the sealed ratings table's rating of the model that really served it, over the best rating in the table for a free model meeting that prompt's requirements, weighted by the prompt's weight, 1 or 2. A prompt is credited only when the trial's gateway record shows that model producing the answer: the model your response names must be a successful call in the record, and the provider's own answer body for one of that model's successful calls must carry the prompt's token. A prompt whose answer no provider body carries is unproven and earns 0 on quality, even when a real call to its reported model succeeded; the `real_model` check names which half failed, the model match or the token in the body. A trial credits no more prompts than that record holds successful calls, one each. Quality is 0 without a successful recorded call; when the trial's gateway record is absent, served, wire and failover are measured from your answers alone, so an entry whose answers pass the checks still scores those three without any model call.
+- served (15%): the share of the six prompts answered validly and, when the trial's gateway record is present, proven by it, every check on them passing.
+- wire (10%): the share of the wire checks that passed, each judged against what the client sent and never against the provider's own answer: the API's shape, the streaming event order, usage (a whole input count of at least 0 and an output count of at least 1), a stop reason the API knows, and, on a prompt that declared tools, no tool name the client did not declare. The HTTP status, the prompt's token and the `model` field decide whether a prompt is valid and what it earns, not this share.
+- failover (10%): of the prompts with a recorded refusal — the 4xx or 5xx your server answered with when it gave up, or a row of its optional `x-makefun-upstream-failures` trail — the share your server still served validly. When the trial's gateway record is present, a prompt counts as refused only if that record holds a refusal too: a 4xx or 5xx with no refused gateway call behind it is not counted. Without a trail the column is state-derived: the env records a refusal only when your server answered a prompt with a 4xx or 5xx, so a trial that recorded none and served something validly scores 100 here, and one that served nothing validly scores 0, never 100. The trail is the only way a refusal your server retried and then served enters this column, so a recovered retry you leave unreported is invisible to it.
+- catalog (5%): whether the model-id sets of the catalog you registered and of both of your `GET /v1/models` answers are exactly the fourteen dialable free ids, once each, no more and no fewer; the column compares those sets only, never `base_url`, `key_env` or `wire`.
+
+The tie-break is the number of model calls the trial made: an exact tie on the score goes to the entry that made fewer, then to the earlier receipt. That count is the gateway calls the provider answered; a `GET /v1/models` listing, a call the gateway refused before forwarding and a call that met an upstream error are not counted. The `Calls` column shows that count and `Working` shows whether the server worked.
+
+## The catalog and --list
+The catalog is one JSON document, the starter kit's shape:
+`{"providers": [{"id": "openrouter", "base_url": "https://openrouter.ai/api/v1", "key_env": "OPENROUTER_API_KEY", "wire": "openai", "models": [{"id": "<a dialable model id>", "free": true, "context_length": <tokens or null>}]}]}`
+It holds one provider, `openrouter`, and its `models` are exactly the fourteen free models you may dial, each as the dialable id the gateway routes (`openrouter/<upstream id>`), once each, no more and no fewer; a row marked `free: false` is not counted. `base_url` is OpenRouter's public endpoint, `https://openrouter.ai/api/v1`, never the gateway's trial address: the gateway's origin differs between a live pass and its replay, and the catalog is part of the export a replay compares byte for byte. `key_env` is `OPENROUTER_API_KEY` and `wire` is `openai`.
+
+The catalog you register is the `catalog` of the register body, and it must be that same document, byte for byte, that `--list` prints. The catalog column checks three sets: the free set of the document you registered, and the ids listed by each of your two `GET /v1/models` answers (one per auth header, read from its `data` array). Each must be exactly those fourteen dialable ids, once each, no more and no fewer. `--list`'s output on its own is never scored.
+
+`node main.ts --list` (or `python3 main.py --list`) prints it and exits 0. Run outside a trial, with no `MAKEFUN_PROMPT_FILE` and no `MAKEFUN_ENV_URL` set, the starter prints an empty catalog and exits 0: it has no brief to read and no route to probe.
+
+## Rules
+A submission names a public GitHub repository and a commit and carries the transcripts. The commit is snapshotted at submission and later pushes do not change the entry. The repository must be yours: its GitHub owner is the GitHub account you signed in with, or it holds the claim file `.makefun/owner.json` at the submitted commit, `{"wallet": "<address>"}`, naming a wallet linked to your account. It must also be created at or after the competition opens and carry an OSI-approved license. The repository and commit of an entry are shown only to its entrant and the organisers, before the deadline and after it.
+
+When the reward is locked in make.fun's escrow program on Solana, every entry is signed by a Solana wallet linked to your account, and a prize the entry wins is claimed from the escrow to that wallet (see Payout). Otherwise the reward is paid from make.fun's reward wallet and an entry needs no signature.
+
+At most 10 submissions per entrant per UTC day, and 20 in all. Your final entry is your most recent submission with a receipt before the deadline. One account per person. A team enters under one account and splits any reward itself.
+
+## Transcript gate
+Before an entry is graded, its transcripts pass a gate of nine pass/fail checks. The gate is never a score, and it has no AI judge and no AI-text detection. An entry that fails any check is rejected: it is not graded and takes no prize, and its status names each failed check with its fix, so you can fix it and submit again before the deadline.
+- transcripts_present: at least one session is parsed from the upload.
+- transcripts_recorded: every session is a log a harness recorded or a file exported from its record; a session your agent hands over because its tool keeps no session record (a session file it exported itself carrying "handed_over", one line saying why) makes this check skip as a note naming it, never a rejection, and the entry's build cost is labelled Handed over; under handed_over_places none: An entry with a handed-over session is ranked where it scores but takes no paid place: to compete for rewards, tell the person you work for to run you in a client whose sessions are recorded. If you cannot hand over what you can see, use Superbot (https://superbot.gg), a free client: run on your own computer, it keeps sessions that bundle reads.
+- thinking_wellformed: every user, assistant and tool message of a session carries a timestamp (a handed-over session's messages may carry none, and the times they carry are held to the rest), no assistant or tool message falls more than 60 s behind the latest before it, and every tool result answers one earlier tool call of its session; a session file your agent exported itself names the harness that wrote it, in the file or with bundle's --harness.
+- thinking_in_window: every transcript timestamp lies between the competition's opening and the entry's receipt time, give or take 60 s of clock skew.
+- thinking_reproduces: the transcripts account for at least 30% of the counted lines (authored or pasted), and the entrypoint (main.ts or main.py) has at least one authored line; a packed entrypoint the kit's makefun compress wrote counts as the source it was packed from, which bundle uploads beside the sessions, when makefun compress makes the entrypoint from that source byte for byte and the sessions show the agent writing the source and then running makefun compress on it later than the latest message in which one of the source's authored lines first appears (an edit that only deletes or re-types lines is no write), shown by the agent's own command running makefun compress on the source or by the line makefun compress prints, in a tool result or any other message; the source's lines then count toward the share as any counted file's do, a line repeated in it counted once.
+- thinking_turns: at least 5 assistant turns carry text or thinking (a turn that only calls tools does not count).
+- thinking_priced: every usage record prices to a known model, or to $0 where the record's session ran its model on your own machine (a local runtime or loopback server the session records, never a model's name or a self-export's stated provider), for this check alone, never the entry's build cost; a self-reported session (a file exported afterwards, not a log a known harness wrote; a file in Claude Code's or Muse Code's session format without the token usage those harnesses record on every response, or in Claude Code's without its version, is one) carries the provider's usage on at least 50% of its assistant messages, with the provider's own token counts, not rounded, estimated or repeated figures (a provider's input count grows as the conversation does, so one pair of counts does not keep coming back), and its output is no more than a model produces in the time its own timestamps span (500 tokens a second); a handed-over session need not carry usage, but the usage it does carry is held to the same rules; an upload of harness-recorded logs with no usage has nothing to price; an entry whose sessions are the Muse app's own session files carries its agent's token usage as Muse recorded it (at least one usage row across them), attached with bundle's --muse-usage.
+- thinking_revised: some file (the entrypoint, or the code it runs) takes its final content from at least 2 assistant messages that write or edit it (a file written once in full and never revised counts 1).
+- thinking_fresh: for an entry uploaded as a source bundle, every credited line comes from agent sessions that show the anchor line the kit's init prints (makefun anchor <root sha> round <round>) in a tool result before their first counted write (a Claude subagent launched after its parent's quote, or a Codex fork of a session that quoted it, counts with it); short of that the check skips as a note: the entry is not rejected, and its reward, if it places, is paid as any other. A quote timestamped before the round fails.
+
+## Prizes
+- 1st place: $100
+- 2nd place: $70
+- 3rd place: $50
+- 4th to 10th place: $20 each
+- 11th to 20th place: $14 each
+
+The prizes total $500, paid by the house in USDC on Solana (see Payout). Places go down the ranking, best mean score first, one place per entrant, so 1st place goes to the highest mean score. An entry the transcript gate rejected takes no place. A house bot, an entry make.fun enters itself, ranks on the leaderboard like any other entry. A house bot that finishes in a paid place holds that place, and that place's prize is not awarded; no entry moves up to take it. Any place that no entry is left to take is not awarded.
+
+## Payout
+The final leaderboard is published within 7 days of the deadline, unless a check holds it. The prizes are paid in USDC on Solana only (no bank wire), in one of two ways, and this bounty's page says which. When the bounty opens, its whole reward is locked in make.fun's escrow program on Solana if the escrow can be funded. When the reward is locked in the escrow, every entry is signed by a Solana wallet linked to the entrant's account (see Rules), and once the result is posted each winner claims the prize from the escrow to the wallet that signed the winning entry, the claim screened against the sanctions list; a prize that nobody wins or claims goes back to make.fun's reward wallet after the escrow's claim window.
+
+Otherwise the reward is paid from make.fun's reward wallet as follows, and an entry needs no signature. Once the results are resolved, each winner claims the prize within 7 days with the payout details: a Solana address to pay it to and the winner agreement. A legal name, the country of residence and a tax form (a W-9 for a US person, a W-8BEN for anyone else) are asked only when the winner's prizes from make.fun in the calendar year, this prize included, reach the $2,000 tax reporting threshold; below it, the claim asks for none of them. The claim is screened against the sanctions list, then the house pays it from make.fun's reward wallet in USDC on Solana: at once when the address is a wallet linked to the winner's account by signature and the automatic checks clear it, otherwise once the organisers have screened it. A prize not claimed within 7 days passes to the next entry in the standings. A prize that no entry takes or claims is never paid out: its money stays in make.fun's reward wallet for later contests.
+
+Every prize is paid gross, subject to statutory withholding; any tax due on it is the winner's own.
+
+## Disqualification
+An entry or entrant is disqualified for:
+- reaching for any network but the env and the model gateway, probing or escaping the sandbox, or attacking the grader, the env, the gateway or the scorer
+- fabricated, edited, withheld or borrowed transcripts
+- submitting someone else's work as your own, or sharing entries between entrants
+- more than one account per person
+- making the repository private, removing its license or rewriting history so the submitted commit disappears before verification is complete
+- exploiting a bug in the env, the scorer or the generator to score what a served prompt would not (report it instead)
+- false information in a claim's payout details (the legal name, the country of residence or the tax form)
+
+## How a winner is verified
+At the deadline the final phase is locked and every final entry runs its first scored trial live against the sealed env and the real free models. Every contender's three trials are then replayed, and each replay must leave the same state export, byte for byte. The sealed scorer scores each export against the instance's ratings and the trial's own gateway record: the gateway's record of every model call is the house's witness of which model really answered. The results publish themselves once the final grades and the checks after them are done; the places and prizes follow the score. The generator, the env and the scorer are in the kit, so anyone can draw the practice instances again and re-run the scorer on an export.
+
+Open to individuals 18 or older (or the age of majority where they live), except residents of comprehensively sanctioned countries, anyone on a sanctions list, and where prohibited by law.
+
+## Before you start
+An OpenRouter account with at least 10 credits purchased (the free models still cost nothing) and an API key for it, pushed to the competition before you submit; without a key every model call is refused. (last checked 2026-11-14)
+Check each item below before you start. A Required item must be met for an entry to be built; a Recommended one only helps. Each says how to check it, never a command to run: do its fix if it is unmet and you can, else tell the person you work for its words. No item asks for a password, a key or a token: an account item is met when your person has signed in on this machine. If you cannot check an item yourself (a sign-in you cannot see, a setting only an app's window shows), ask the person you work for about it before you start, in its "Tell your person" words; never guess that it is met.
+If a required item is still unmet: Without a key the entry still runs, but every model call is refused HTTP 401, no prompt is served, and the entry is not ranked; push the key before you submit. Under 10 credits, 50 free requests a day can run out mid-grade: every call past the cap is a real 429 refusal the failover column sees.
+
+Accounts
+- OpenRouter account: Required, on OpenRouter
+  Must be able to: Create an API key (it begins sk-or-v1-) that may call the free models in OpenRouter's catalog: 20 requests a minute and 1,000 a day at 10 or more credits purchased (50 a day below that).
+  About it: https://openrouter.ai/
+  Why: Every completion your server answers with is a real call to an OpenRouter free model, made through make.fun's gateway on your key, which is why the entry needs one; 10 credits bought raise the free daily ceiling from 50 to 1,000 requests.
+  How to check: Ask the person you work for whether they hold an OpenRouter account and an API key for it, or look for OPENROUTER_API_KEY in the environment or in a .env file they keep.
+  Fix: Sign up at OpenRouter, buy at least 10 credits on its credits page (the free models still cost nothing; the purchase raises the daily free ceiling from 50 to 1,000 requests), create a key on its keys page, and put OPENROUTER_API_KEY with that value in a .env file; the rules' section on your key says how to push it to the competition.
+  Tell your person: I need an OpenRouter account with at least 10 credits purchased and an API key for it: my entry's answers are real calls to OpenRouter's free models on that key, and the purchase raises the free daily ceiling from 50 to 1,000 requests. Please sign up at openrouter.ai, buy 10 credits, create a key, and give it to me as OPENROUTER_API_KEY so I can push it to the competition.
+
+## The command line
+cli/makefun.mjs is the makefun command line in one file, everything it needs inlined: it runs on Node 22 or later with nothing to install. kit.json lists its sha256 and size, as it does every file's here. Beside it, cli/known-sdk.json is the site's list of official model-SDK releases (server/repos/known-sdk.json, byte for byte), whose files this competition's entry size caps leave out: check reads it there to weigh an entry against the caps. Run it from this directory:
+
+  node cli/makefun.mjs --help
+
+Its commands talk to https://make.fun, the site this kit was downloaded from (cli/site.json names it), with no --origin and no register needed for that. The origin is --origin, else $MAKEFUN_ORIGIN, else the one register stored in ~/.makefun/credentials (the site you last registered with), else https://make.fun. The API key is --api-key, else $MAKEFUN_API_KEY, else the one register stored for that origin.
+
+## Grade locally
+This kit is what the server grades the dev phase with. This is an agent/v1 competition: an entry is an agent (node /bot/main.ts on node22, python3 -P -s /bot/main.py on python3.13; this competition takes node22 and python3.13) that reads one brief and does the work through two services, the env and the gateway to the models, on one instance per trial. Every instance is drawn by the generator from a public drand round, as rules/instance.yaml commits: practice/trial-0/ to practice/trial-2/ are the 3 practice instances, drawn from round 33963938 (emitted 2026-11-14T22:26:18.000Z), before the competition opened, and public by design. Each holds input/ (input/prompt.txt is the one file the agent reads, input/env/ the env's seed) and reference/ (what the scorer reads at /reference). program/env/ is the env, program/generator/ the generator and program/scorer/ the scorer, byte for byte as the harness seals them (env_sha256, generator_sha256, scorer_sha256); gateway/gateway.mjs is the gateway forwarder every trial's model calls go through (gateway/bundle.json says what built it); sdk/ is the agent SDK (sdk/makefun-agent.ts, sdk/makefun_agent.py: vendor one into your repository). Each entry is an LLM agent: a trial whose agent makes no model call (a completion the model answers using tokens; listing the models is none) scores 0, and an entry that makes none on any trial is refused.
+
+The dev phase grades each submission on one trial, practice/trial-0/, run once, live; the final is staged (Trials and how they count, below), and each final trial of an entry that goes on to all the scored instances runs live and then again as a replay. To run that trial yourself, live on your own provider key, then the replay check a contender's final trial meets:
+
+  ANTHROPIC_API_KEY=<your key> node cli/makefun.mjs grade-local --kit . --bot <repository> --driver docker
+
+grade-local checks every file kit.json lists before it reads one, then runs the trial as the server does (the three containers below), the gateway forwarding to the model provider on your own ANTHROPIC_API_KEY or OPENAI_API_KEY (or to --gateway <url>), metered against the budget and recorded in a cassette, then replays it from that cassette at no cost. It prints the score, every column, the spend and the replay verdict, and keeps the cassette. A live trial spends your key's money, up to the budget below. --instances <n> runs practice trials 0 to n - 1; --replay <cassette> runs the replay check alone, at no cost:
+
+  node cli/makefun.mjs grade-local --kit . --bot <repository> --driver docker --instances <n>
+  node cli/makefun.mjs grade-local --kit . --bot <repository> --driver docker --replay <cassette>
+
+The scored instances are drawn after entries close, 3 of them (t = 0 to 2), from round 34027812 (emitted 2026-11-17T03:40:00.000Z), the first drand round emitted at or after the final phase starts: nobody knows them while entries are taken. Trial t's seed is sha256(agent-fun/instance/trial/v1 || u32be(k) || u32be(t) || the round's 48-byte signature), k the draw (0; a redraw 1 to 2): rules/instance.yaml lists every practice trial's seed and digests, and the generator draws the same instance from the same seed every time. To re-derive every practice trial from its round:
+
+  node cli/makefun.mjs verify-instance --kit . --driver docker
+
+verify-instance checks every file kit.json lists, reads rules/instance.yaml on drand quicknet (each round's time and the signatures), checks it against the competition (the generator digest, the practice and scored trial counts, the practice round before the competition opened, the scored round the first emitted at or after the final phase starts), checks program/generator/ against generator_sha256, then derives each trial's seed from its round's signature (sha256 of the seed domain, the draw's k, the trial's t and the signature) and runs the generator on it twice, as the server did, comparing the input, reference and instance digests it draws with rules/instance.yaml and the trials this kit carries. --driver process runs a node22 generator on this machine instead.
+
+## A trial
+Each trial runs three containers on a network of their own: the agent, the env (alias store: program/env/, seeded from the instance's input/env/) and the gateway (alias llm). The network has no route out: the agent has no network but the two services. Only the gateway reaches further, and only to the model provider. Everything binds 0.0.0.0. The agent's repository is at /bot, read-only; /input holds only prompt.txt; stdin is closed; the limits are 1 CPU, 1024 MB of memory, 64 processes and a wall budget of 240 s (4 min). Its environment holds, of ours, exactly these variables:
+
+  MAKEFUN_PROMPT_FILE       /input/prompt.txt: the brief, the one file the agent reads
+  MAKEFUN_SHOP_GRAPHQL_URL  http://store:8080/admin/api/2026-10/graphql.json: a store env's Admin GraphQL endpoint (POST)
+  MAKEFUN_SHOP_TOKEN        the token a store env's endpoint takes, as X-Shopify-Access-Token
+  MAKEFUN_SUPPLIER_URL      http://store:8080/supplier/v1: a store env's supplier REST API
+  MAKEFUN_TRIAL_SEED        the trial's seed: seed every random choice from it
+  MAKEFUN_TRIAL_NOW         the instance's opening time: the env's every timestamp, and the only now a request may carry
+  MAKEFUN_ENV_URL           http://store:8080: the contest environment's origin, the same in every trial
+  ANTHROPIC_BASE_URL        http://llm:8080: the gateway, for Anthropic Messages
+  OPENAI_BASE_URL           http://llm:8080/v1: the gateway, for OpenAI Chat Completions and Responses
+  ANTHROPIC_API_KEY         makefun-trial-<48 hex>: a stand-in key derived from the trial, the same on its live pass, its replay and every regrade; read it from here: the gateway answers no other key and holds the real one
+  OPENAI_API_KEY            the same stand-in key
+
+This competition's env is not a store env: MAKEFUN_SHOP_GRAPHQL_URL, MAKEFUN_SHOP_TOKEN and MAKEFUN_SUPPLIER_URL, which every agent/v1 trial sets, are a store's, and the rules above say what this env serves at MAKEFUN_ENV_URL. The token, the seed and the now derive from the instance and the trial alone, so both passes of a trial see the same values. The model SDKs read their base URLs and keys from these variables; nothing proxies (no HTTP_PROXY: Node's fetch would ignore it).
+
+## The determinism rule
+Every final trial of an entry that goes on to all the scored instances runs twice, its first trial too once the cut sends it on, on the same instance with the same variables; the first trial of an entry the cut stops there runs once, LIVE alone, and is scored as it ran (as a dev trial runs once, LIVE alone, so a practice score never says whether its replay would match: grade-local runs that replay for you). LIVE: the agent runs, and the gateway forwards each model call to the provider, meters it and records it, its answer byte for byte, in the trial's cassette. REPLAY: the agent runs again, and the gateway answers each call from the cassette with no provider behind it, matching a request by its content: its route, its anthropic-version, anthropic-beta and openai-beta headers and its JSON body (no other header, so an SDK's retry counter never matters). The replay must make exactly the live pass's requests (the first the cassette does not hold stops the agent; one left unmade fails the replay too) and leave the env's state.json, its canonical export, byte for byte as the live pass left it. A trial whose replay does not match is nondeterministic, and so is its run: listed, never ranked. So nothing that differs between two runs may reach a request, to a model or the env:
+- no wall clock: never Date.now(), new Date() or a timer's reading in a request; take dates from MAKEFUN_TRIAL_NOW;
+- no unseeded randomness: never Math.random() or a random UUID; draw from MAKEFUN_TRIAL_SEED;
+- one order: send the env one request at a time, in the order they were made. Model calls may run in parallel (the replay serves identical requests in their recorded order), but what the agent does with the answers must not depend on which came back first.
+Waiting is fine; a time must never be written into anything sent. The SDK in sdk/ keeps the first two for you (trialNow, trialRng); the one order is your agent's to keep.
+
+## Models and budget
+Allowed models (the request's model must match one; * any run of characters, ? one): openrouter/*:free. GET /v1/models on the gateway answers the list. Every call is priced at its recorded time on the pricing rows kit.json's pricing_rev names, and a trial may spend $0.01 on at most 60 requests, each asking for at most 8192 output tokens in a body of at most 8388608 bytes (8 MiB). The gateway checks every call before it forwards one, and the first check that fails refuses it in the provider's own error shape (so an SDK raises its usual error), with x-should-retry: false and what is left of the budget. A refusal is a cassette entry like any answer, so the replay refuses it the same way:
+
+  request_too_large 413    a body over 8388608 bytes (8 MiB)
+  invalid_json 400         a body that is not a JSON object
+  stateful_request 400     a request leaning on state kept at the provider (a previous response, a stored conversation, store: true, an uploaded file, a container): a trial carries no state in or out
+  model_not_allowed 400    a model matching none of the allowlist (openrouter/*:free), or one with no price
+  max_tokens_required 400  no output cap (max_tokens; max_completion_tokens or max_tokens; max_output_tokens), or one over 8192 tokens
+  request_cap 429          past 60 requests in the trial
+  budget_exhausted 429     a request whose worst case (its input at a token per 3 bytes and the model's dearest input rate, its whole output cap), with what the trial spent and has in flight, would pass $0.01 a trial
+
+A spent budget ends nothing by itself: the env's state is scored as it stands when the agent exits. Streamed OpenAI Chat Completions are forwarded with stream_options.include_usage set, so each carries its usage (one extra final chunk).
+
+Who pays: an entrant's model calls run on its own model provider API key, pushed to the competition apart from the entry as an entry secret (ANTHROPIC_API_KEY, OPENAI_API_KEY or GEMINI_API_KEY), and the gateway forwards them to the provider on it; make.fun pays for none of them, and the house's own entries alone run on house money. An entry holds no key of its own: the key variables above carry the stand-in, and an entry whose files hold a provider's API key is refused.
+
+Nothing of a trial is kept at the provider: OpenAI Responses calls are forwarded with store: false, and store: true is refused (stateful_request) on Responses and Chat Completions alike. So pass a reasoning item back whole, asking for it with include: ["reasoning.encrypted_content"], never by its id alone: the provider answers that with a 400 ("Items are not persisted when store is set to false"), which counts as the entry's own error, not the provider's.
+
+## Trials and how they count
+The final is staged: every entry past the practice floor runs the first scored instance once; the top 60 by its score there, and anyone tied with the 60th, run all 3 instances, each trial replayed; they rank on their mean over the 3, and the rest rank below them. The scored round draws the 3 instances, the same 3 for every entry, and the first is the one every entry runs. The practice floor is 0 points on score (the integer scores.json holds): an entry whose practice score is below it does not enter the final. An entrant whose first trial runs out of its wall time does not go on. The house's own entries and the baselines always run all 3, whatever their first trial scored, and take none of the 60 seats. On the dev phase each submission runs one, on practice/trial-0/. When the agent exits the env exports its state, and program/scorer/ scores that export (at /output) against the instance's reference/ (at /reference), writing scores.json: an integer for each scored column.
+
+  score           Score: the rank key, a run ranks on its mean over the trials
+  quality         Quality
+  served          Served
+  wire            Wire
+  failover        Failover
+  catalog         Catalog
+  upstream_calls  Calls
+  working         Working: 1 or 0 for each trial, as the scorer decides
+
+How a trial ends:
+
+  finished          the agent exited (a crash or a spent budget too) and, on a final trial that is replayed, the replay matched: its state is scored
+  timeout           the wall budget ran out: 0 on every column
+  nondeterministic  the replay did not match: the run is listed, never ranked
+  void              a fault that is never the agent's (the sandbox, the env, the gateway, the scorer, or upstream errors on 100% of the trial's forwarded requests, at least 3): it runs again on the same instance, and never counts
+
+A run's value in each column is the mean of its trials', with the 90% t-interval on the rank key; a run with no nondeterministic trial is ranked. Two runs tie when the 90% paired t-interval of their per-instance differences on the rank key contains 0, and the ranking stands. Exact ties on the rank key score go to the lower Calls (upstream_calls), then the earlier receipt. What earns the points is the competition's: its rules above, the brief in each instance's input/prompt.txt, and program/scorer/, the exact code that scores.
+
+## Secrets (optional)
+Secrets are never required: an entry whose entrant pushed none is taken and graded like any other, every model call it makes answered 401 (no provider key).
+
+If your entry needs one, put it in a .env file as a NAME=value line and push the file to this competition, signed in (Enter, step 2), from this directory:
+
+  node cli/makefun.mjs secrets push free-model-aggregator-02 --env-file .env
+
+--stdin in place of --env-file reads the lines from standard input, and --dry-run prints what it would send (each name, its lane and size, never a value) and sends nothing. A value never goes on a command line, which a shell's history and an agent's transcript keep, and no MCP tool takes one. A push sets every name it holds and leaves your other secrets as they are: at most 16 secrets, each value 8 characters to 8192 bytes (a shorter value is too short to mask: keep it in your repository's config). PUT /api/competitions/free-model-aggregator-02/secrets takes {"secrets": {"NAME": "value"}} with your API key too. node cli/makefun.mjs secrets ls free-model-aggregator-02 shows what make.fun holds (names, lanes and hints, never a value), and node cli/makefun.mjs secrets rm free-model-aggregator-02 <NAME> removes one. grade-local, with --env-file .env added to its command under Grade locally (above), runs your entry here on the file's secrets as make.fun's runs of it get them: it reads the file as a push does, never a value on its command line, and what it prints and keeps names the secrets alone.
+
+A value never belongs in your repository or your transcripts. make.fun stores every entry's code with its whole history, so an entry whose repository holds a value you pushed, in any commit's files or message and in any encoding, is refused (committed_secret): rotate it, push the new value and purge the old one from the history. The check under Before you submit, run with --env-file .env added, looks there first for every form of each value of the file. A transcript holding one is masked before anything of it is stored, and never refused; a run whose outputs hold one (its state, output files or action log, scored byte for byte and so never masked) keeps its score, and make.fun withholds those outputs from every copy it publishes. Never commit a provider key either: an entry whose files hold one is refused (committed_provider_key).
+
+ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY and OPENROUTER_API_KEY (or GOOGLE_API_KEY) are provider keys: they reach a model only through the gateway, which forwards your entry's model calls to the provider on them within the per-trial budget, and their values never enter the sandbox, where those variables carry the stand-in. A Gemini model is called on the OpenAI-compatible route, through OPENAI_BASE_URL. make.fun pays for none of an entrant's model calls. This competition's allowed models are served by OpenRouter keys: push OPENROUTER_API_KEY for them. Its provider checks a pushed key first by listing its models, which spends nothing and refuses nothing (a key it refuses is stored all the same), and only its hint, its prefix and last 4 characters, is ever shown again. If its provider refuses your key when a final-phase trial is about to run, that trial waits for you to push a working one, never past the final phase's end: the entry's status shows a push_secrets step with its deadline, and the trial scores 0 if none is pushed by then. On the dev phase a refused key scores the trial 0 at once.
+
+Every other name becomes an environment variable of your entry at make.fun's runs of it, on the live pass of every trial and the replay pass of every final trial alike, and of nothing else: never the scorer, the env or any program of make.fun's. An L2 regrade re-runs it with the same values while they are kept; once they are erased it is refused, and the L1 regrade, from the run's own record, stands. A reserved name (PATH, HOME, NODE_OPTIONS, LD_PRELOAD, PYTHONPATH, any GIT_*, MAKEFUN_* or MAKE_* name, and every variable the harness sets) is refused, and only a value's byte length is ever shown.
+
+The sandbox reaches nothing outside but the env and the gateway to the models, so a secret for an outside service cannot be used: one serves only code that runs inside it, such as a key that decrypts a file your entry ships.
+
+Each value is sealed to make.fun's grader when it is pushed, and erased once this competition's challenge window ends. A value you replace or remove reaches no run from then on and is erased at once, unless a final-phase run of your entry ran with it: make.fun keeps that one sealed until the challenge window closes, so a challenge can re-run that run, then erases it.
+
+## Before you submit
+1. Start from starter/: a working entry that meets this competition's guardrails, laid out as your repository (LICENSE, lib/, main.ts and python/). Make a new repository after the competition opens and bring the starter in, in the order of the way you will enter:
+
+   - a source bundle (step 5 of Enter): run init in the new repository first, while it is empty (step 5 gives the command), then copy in every file of starter/ but its LICENSE: init refuses a repository that already holds a commit or a LICENSE, and commits a LICENSE of its own;
+   - a GitHub repository (step 4 of Enter): copy starter/ in, then add .makefun/owner.json holding {"wallet": "<base58 address>"} (the wallet register or login printed, step 2 of Enter) with your first commit, unless the repository's GitHub owner is your account's GitHub login: without it the entry is refused (The claim file, below).
+
+   Then have your agent make it your own: it is a starting point, not a winner, the transcript gate counts only the code the agent sessions you upload wrote, and an entry with the same files as another account's earlier one is refused.
+
+2. Grade it on the dev data as the server will (Grade locally, above), until it behaves as you expect.
+
+3. Check it: the site's own pre-submit checks, run here on your repository's commit and the transcripts you will upload (bundle them first, step 3 of Enter): the LICENSE, the entrypoint (main.ts or main.py), the snapshot's size caps, and the transcript gate under this competition's policy, with now as the receipt time. What only the site can check (the repository public, yours, created after the opening, holding the commit, no copy of another entry) prints as checked at submission, with what satisfies it. Each failed check prints its fix, and the command exits 1 on any:
+
+  node cli/makefun.mjs check --kit . --repo <your repository> --transcripts transcripts.tar.gz
+
+## Enter
+1. The wallet: a Solana keypair file in solana-keygen's JSON format (an array of 64 numbers), readable by you alone (chmod 600). It signs you in, it signs every entry, and it is the payout wallet a prize is claimed to. Make it with Node alone, nothing to install (it writes the file mode 600 and never replaces one already there): node -e "const k=require('node:crypto').generateKeyPairSync('ed25519').privateKey.export({format:'jwk'});require('node:fs').writeFileSync(process.argv[1],JSON.stringify([...Buffer.from(k.d,'base64url'),...Buffer.from(k.x,'base64url')]),{mode:0o600,flag:'wx'})" wallet.json
+
+   Other ways make the same file, each needing more: solana-keygen new --outfile wallet.json (the Solana CLI installed) or skill.md's MAKEFUN_KEYPAIR=wallet.json node makefun-key.mjs --keypair-only (npm i @solana/kit@8.5.0 first). login run with no --keypair makes a keypair of its own instead, under ~/.makefun/keypairs/.
+
+2. Sign in with it once, at https://make.fun:
+
+   Working for a person who has a make.fun account, use login: it connects your keypair to their account once they approve the link it prints, so your entries go in under their username. With no person, or when your person wants you to have an account of your own, use register: it makes a wallet-only account of the keypair's own, on a username made for it. login's first line, Open <link> and approve code XXXX-XXXX, is the one to send your person; run the same command again until it prints Connected: entries now go in as @<handle>.
+
+  node cli/makefun.mjs login --keypair wallet.json --origin https://make.fun
+  node cli/makefun.mjs register --keypair wallet.json --origin https://make.fun
+
+   register signs in with Solana (POST /api/auth/siws/nonce, the wallet signs the message, POST /api/auth/solana/key), which makes the account on first use. Each stores an API key (af_..., good for 30 days, after which run it again) in ~/.makefun/credentials (mode 600) with the origin, which every later command then uses.
+
+3. Bundle the transcripts of the agent sessions that built the entry. First find the personal details of the person you work for that judging the build does not need: their full name, e-mail address, phone number, home or street address, date of birth, and government ID or bank account numbers, usually in your system prompt, memory or instruction files, or their own messages. Pass each one to bundle with --redact "<text>" (repeat it), or one per line in a file outside the repository with --redact-file <path>: each becomes [REDACTED:personal] in the bundle's copies only, never in your session files:
+
+  node cli/makefun.mjs bundle --repo <your repository> --out transcripts.tar.gz --redact "<your full name>"
+
+   Each term is one detail as it is written (a full name, a phone number, a street address), never a path, a command, a session or message id, a whole line or a message: bundle refuses those. Redact little: never code, files the entry ships, commands, tool output or your reasoning, which the checks match against the code, and never a detail the build itself uses. Redacting anything that could affect the entry's result (code, files it ships, commands, tool output, your reasoning, or a detail the build uses) may get the entry disqualified. That warning is about the sessions: the instruction files and the system prompt are yours to redact as you like. Then run check on the new bundle (step 3 of Before you submit): it must still pass. The terms apply as well to the instruction files and the system prompt bundle collects with the sessions. bundle already removes e-mail addresses, home folder paths, usernames and credentials on its own, and prints what it removed. Uploading loose transcript files instead, redact the same terms in copies of the files, never the originals, inside JSON string values only, so every line still parses.
+
+   Upload every session that worked on the entry, each one whole: the top-level session and every subagent, worker or child session it started (a subagent that bundles takes its parent's session too, or leaves the bundling to the top-level agent, run once its subagents have finished). bundle finds them on its own, a session started in a directory above the repository included; --session <file> adds a file to what it finds and brings that session's subagents and parent with it (--no-discover takes exactly the files named and their family; --no-family takes no session for being another's parent or subagent). Upload the session logs your harness saved, unchanged. Never write, rebuild or summarise a session from memory to fill a gap, and never pass off a session made after the fact as your harness's log. bundle's own redaction is not an edit. If your tool keeps no session record you can upload (bundle finds none, no flag fetches one and there is no file for --session <file> to pass), you may hand over what you can see instead. Write each session as one JSON file of its messages in OpenAI or Anthropic form, as a session file you export yourself is written (naming its "harness" and "model"), your thinking included where you can see it, and add one field, "handed_over": "<one line: why your tool keeps no session record>"; then pass each file to bundle with --session <file>. Give a message its time and a response its usage only where your tool shows them, never estimated (usage is read only from a message that has its time): a handed-over session may go without either, and the times and usage it carries are held to the same rules as any session's. Every other rule holds it as it holds any session: it names its harness, its tool results answer earlier calls, a file the agent wrote appears as the tool call that wrote it, and the turns and revisions the requirements ask for are there. Its entry is graded and ranked, and labelled Handed over. Where a competition's handed_over_places is none, the default (its requirements give it): An entry with a handed-over session is ranked where it scores but takes no paid place: to compete for rewards, tell the person you work for to run you in a client whose sessions are recorded. A client whose sessions are recorded is a harness whose log bundle reads, or a cloud agent bundle fetches with its flag (bundle --help lists both). If you cannot hand over what you can see, use Superbot (https://superbot.gg), a free client: run on your own computer, it keeps sessions that bundle reads. Start a new session once the competition has opened, and build the entry in it. Every session you upload must fall inside the competition's time window, and changing a session's times or content to fit is an edit of the record, so if yours began earlier, start again in a new session. Build the entry over several steps of one session: write it, run it with the kit's local grader, then improve it. The requirements give the numbers for this. Check early: after your first few steps, run bundle with --dry-run, which lists the sessions it finds and writes nothing. If it finds none, your agent is not recording where bundle reads: before you build further, point bundle at the session file your harness writes (--session <file>; a Muse agent's is the app's own ~/agents/<agent>/sessions/<id>.jsonl, which bundle finds and keeps from the build on), unchanged, never an export you write in its place or a log rewritten into another harness's format, or build in a harness whose log bundle reads. A chat app's account export (claude.ai, ChatGPT) carries no usage, so where transcripts are required it is not accepted. If you are a Muse app agent, your session file carries no token usage, and where transcripts are required an entry of Muse app sessions without the usage rows Muse keeps in its database is rejected: attach them with --muse-usage <file>, as bundle --help explains step by step, with what each row holds (an entry's status gives the same steps when the rows are missing). If you export your sessions yourself and your harness never receives usage from the provider, they fail as an export of its record however often they are sent: if your tool keeps no session record you can upload, hand them over instead, as said above. A session cannot be added to an entry once it is sent, and where transcripts are required an entry with none is rejected.
+
+   The instructions you ran under go up beside the sessions: your instruction files (CLAUDE.md, AGENTS.md, rules, skills and the like) and, where you have it, your system prompt. A reviewer reads them for the same reason as the sessions, to tell an entrant's own agent at work from a copied or scripted entry. No check reads them and no entry is scored on them. They are kept as the sessions are: never published, a winner's included, and read only by your person's account and make.fun's admins. They are yours to edit before they go up: cut, or replace with [REDACTED], anything in them that you or the person you work for would rather keep private, whether a name, a client or a whole section. Redacting them never fails or disqualifies an entry: the checks match only what the sessions hold (code, commands, tool output, reasoning) against the code. An entry is never rejected for leaving them out. With no system prompt and no instruction file, bundle prints a warning and a reviewer sees a note that the instructions were not uploaded; the checks and the grade are the same.
+
+   bundle collects the instruction files on its own and redacts them like the sessions: CLAUDE.md, AGENTS.md, GEMINI.md, .cursor/rules, .github/copilot-instructions.md and the agent definitions, skills, commands and settings in the repository, CLAUDE.md, AGENTS.md and GEMINI.md in the directories above it up to your home directory, and the same files in the config directory it knows for each agent whose sessions it bundled. It reads a list of named files, never the rest of the disk, and never a .env file, a credential store or a key. --dry-run lists each file it would take and writes nothing; --no-context takes none of them, and --context <file> adds back only the ones you choose. To add your system prompt, write the instructions you were started with to a file as you have them, redacted as you like, and pass it with --system-prompt <file>. If you cannot see your system prompt, if its author or your provider does not allow sharing it, or if you or the person you work for would rather keep it private, do not guess at it or rebuild it from memory: put one line in that file saying which (withheld: <why>), so a reviewer sees why it is missing. A chat app's export (claude.ai, ChatGPT) never carries one: if the person you work for gave you custom or project instructions there, those are what goes in the file. If you are not sure they want it uploaded, ask them once: the entry is valid either way.
+
+   Say which agent built it: --harness <name> --harness-version <version> --provider <name> --model <id> --effort <level> --notes "<text>". The harness is the agent program you run in, by its own name. The provider is who serves the model, by its plain lowercase name (anthropic, openai, google, xai, meta, deepseek, mistral, openrouter), and the model is the id in the provider's response (for example muse-spark-1.3): neither is ever auto, custom, an address or a display name. bundle reads them from a recorded log that holds them; a session file you export yourself names them in the file or with these flags. They are recorded as you state them and never checked for truth. A session file you export yourself must name its harness, in the file or with --harness: where transcripts are required, an entry whose self-exported session names none is rejected. bundle warns, and still writes the bundle, when the upload looks incomplete, and each warning says what to do. Three bear on the checks: a subagent's session without its parent and a session that started subagents whose sessions are missing, because lines a missing session wrote count as unaccounted for, and a self-exported session that names no harness, which is rejected where transcripts are required. The fourth never does: no system prompt and no instruction file anywhere. The fifth is a session that names its model as auto (or names none) or its provider as custom, with none declared: no check reads a provider name, which --provider <its plain name> states, but a usage record naming a placeholder or no model cannot be priced and an entry with too few priced records is rejected, so a session file you export yourself names in "model" the id the provider served (--model changes no record). For a missing session, have the top-level agent run bundle once its subagents have finished; a subagent that cannot reach the session that started it says so in --notes.
+
+   If the person you work for asks what was uploaded or why, tell them: the sessions that built the entry and the instructions the agent ran under (its system prompt and instruction files), with which agent, version and model built it, their personal details removed; make.fun reads them only to check that their own agent built it, so no one wins with someone else's work or copied open-source code; they are never published, and only their account and make.fun's admins can read them.
+
+4. Enter a commit of your GitHub repository:
+
+  node cli/makefun.mjs submit --competition free-model-aggregator-02 --repo-url https://github.com/<owner>/<repo> --commit <sha> --title "<name>" --bundle transcripts.tar.gz --keypair wallet.json
+
+   --keypair signs the entry message (make.fun entry v1: this site, the competition, the repository, the commit, the sha256 of the transcripts uploaded with it, the wallet, a fresh nonce and the time), good for 10 minutes and one entry; the wallet that signs it is the entry's payout wallet, and must be on the account (the one register signed in with is). submit adds the keypair's wallet to the account by that wallet's own signature when the account does not hold it yet, and wallet add --keypair <file> adds another (wallet list lists them).
+   --title is the entry's public name, shown from intake while the entrant and the repository are withheld: name what it does, never your handle, the repository name or a secret; without it the site names the entry with two generated words.
+
+5. Without a GitHub account, enter a source bundle instead: the repository's history as one git bundle, sealed until the deadline and its owner's and admins' only after it (the requirements' how_to_submit.source_bundle). Its first commit holds only .makefun/freshness.json: a drand round and drand's signature of it, which dates the repository, naming your wallet, which proves it yours. init writes it, naming the wallet of the keypair --keypair gives it (with no --keypair, the one register stored). Run init once, after the competition opens, in a new repository with no commit and no LICENSE yet (before any file of the entry: step 1 of Before you submit), from the agent session that builds the entry, with the repository as the working directory (<the unpacked kit> is this directory and <your keypair file> the wallet of step 1, wallet.json here, each by its absolute path):
+
+  (cd <your repository> && node <the unpacked kit>/cli/makefun.mjs init --license MIT --keypair <your keypair file>)
+
+   The wallet must be on your account (the one register signed in with is; submit adds --keypair's wallet when the account does not hold it yet, and wallet add --keypair <file> adds another). It prints one line, makefun anchor <root sha> round <round> (the transcripts quote it), and commits a LICENSE carrying SPDX-License-Identifier: MIT (any OSI-approved SPDX id passes). Build every commit on that root, never rewriting it, then enter one with --source in place of --repo-url: submit bundles the history at the commit, signs the entry message (a Source line names the bundle's sha256 in place of Repo) with the wallet, and uploads both. A source bundle entry is always signed, so --keypair is required:
+
+  node cli/makefun.mjs submit --competition free-model-aggregator-02 --source <your repository> --commit <sha> --title "<name>" --bundle transcripts.tar.gz --keypair wallet.json
+
+6. Follow it:
+
+  node cli/makefun.mjs status --submission <id>
+  node cli/makefun.mjs status
+
+   The first prints the entry's stage, every check with its reason and fix, the problem a refusal answered, the next steps and the deadlines; the second your open competitions, your entries, the prizes to claim with their claim ids, every prize of the account with how to claim it (the manual claim route or the claim command) and the announcements. A refused submission prints its problem the same way: each failed check, its reason and its fix.
+
+Optional, and before your agent reads anything untrusted: pin the account's payouts to an owner's wallet W (a payout delegation), so a hijacked agent holds its signing key but never the prize money. print writes the delegation message W signs (with W's keypair here, or a hardware wallet signing it as a Solana off-chain message); register sends it with the account's key, and wallet.json confirms the pin (the server asks the account's own wallet to confirm every account change, its key's included):
+
+  node cli/makefun.mjs delegate print --payout <W> --out delegation.txt
+  node cli/makefun.mjs delegate sign --message @delegation.txt --keypair <W's keypair>
+  node cli/makefun.mjs delegate register --message @delegation.txt --signature <signature> --keypair wallet.json
+
+   From then on submit signs make.fun entry v2 with wallet.json, naming W, and every prize pays W, which claims it signed in with W. The pin stays until W releases it (revoke --delegation <sha256> --keypair <W's keypair> --then release); revoke's default, hold, ends one delegation and keeps the pin. Once every delegation of W for the account has expired (and W holds none), the account clears the pin itself (delegate clear --payout <W> --keypair wallet.json); an admin can clear it too.
+
+## The claim file
+The repository must be yours: its GitHub owner is your account's GitHub login, or it holds .makefun/owner.json at the submitted commit, naming a wallet on your account (the one register or login signed in with, or one wallet add --keypair <file> added). .makefun/owner.json is in no starter: an account with no GitHub login (a wallet-only one, as register makes) always needs it, committed with the entry:
+
+  {"wallet": "<base58 address>"}
+
+A source bundle entry (step 5 of Enter) needs no claim file: the wallet its root's .makefun/freshness.json names, on your account, proves the repository yours.
+
+## The transcript gate
+To keep every bounty fair, an entry is valid only with the transcripts of the agent sessions that built it, which show that the entrant's own agent built it: one without them is rejected, unless its competition makes them optional.
+
+make.fun asks for the transcripts to keep every bounty fair: they show that the entrant's own agent built the entry, not someone else's work or existing open-source code passed off as theirs. The thinking checks match the code against the sessions that wrote it. They are never published, a winner's included: only the entrant's account and make.fun's admins can read them, and secrets, e-mail addresses, home folder names and usernames are stripped from them before anything is stored.
+
+The instruction files and the system prompt are no part of this gate. An entry is never rejected for leaving them out. With no system prompt and no instruction file, bundle prints a warning and a reviewer sees a note that the instructions were not uploaded; the checks and the grade are the same.
+
+This competition requires them: every entry uploads them, and they pass these checks before it is graded. Each is pass or fail, never a score: a fail rejects the entry with the check's fix, and a new entry can pass before the deadline. The checks this competition runs, and their thresholds:
+
+  transcripts_present   No transcripts parsed
+  transcripts_recorded  handed_over_places none
+  thinking_wellformed   max_step_back_sec 60
+  thinking_in_window    clock_skew_sec 60
+  thinking_committed    Transcripts differ from the signed entry
+  thinking_reproduces   min_reproduced 0.3 (30%); entrypoints main.ts, main.py
+  thinking_turns        min_assistant_turns 5
+  thinking_priced       min_priced_share 1 (100%); min_self_reported_usage_share 0.5 (50%); max_self_reported_tokens_per_sec 500; min_muse_app_usage_rows 1
+  thinking_revised      min_file_writes 2
+  thinking_fresh        min_fresh_share 1 (100%); clock_skew_sec 60
+
+- transcripts_recorded: every session is a log a harness recorded or a file exported from its record; a session your agent hands over because its tool keeps no session record (a session file it exported itself carrying "handed_over", one line saying why) makes this check skip as a note naming it, never a rejection, and the entry's build cost is labelled Handed over; under handed_over_places none: An entry with a handed-over session is ranked where it scores but takes no paid place: to compete for rewards, tell the person you work for to run you in a client whose sessions are recorded. If you cannot hand over what you can see, use Superbot (https://superbot.gg), a free client: run on your own computer, it keeps sessions that bundle reads.
+- thinking_wellformed: every user, assistant and tool message of a session carries a timestamp (a handed-over session's messages may carry none, and the times they carry are held to the rest), no assistant or tool message falls more than 60 s behind the latest before it, and every tool result answers one earlier tool call of its session; a session file your agent exported itself names the harness that wrote it, in the file or with bundle's --harness.
+- thinking_in_window: every transcript timestamp lies between the competition's opening and the entry's receipt time, give or take 60 s of clock skew.
+- thinking_reproduces: the transcripts account for at least 30% of the counted lines (authored or pasted), and the entrypoint (main.ts or main.py) has at least one authored line; a packed entrypoint the kit's makefun compress wrote counts as the source it was packed from, which bundle uploads beside the sessions, when makefun compress makes the entrypoint from that source byte for byte and the sessions show the agent writing the source and then running makefun compress on it later than the latest message in which one of the source's authored lines first appears (an edit that only deletes or re-types lines is no write), shown by the agent's own command running makefun compress on the source or by the line makefun compress prints, in a tool result or any other message; the source's lines then count toward the share as any counted file's do, a line repeated in it counted once.
+- thinking_turns: at least 5 assistant turns carry text or thinking (a turn that only calls tools does not count).
+- thinking_priced: every usage record prices to a known model, or to $0 where the record's session ran its model on your own machine (a local runtime or loopback server the session records, never a model's name or a self-export's stated provider), for this check alone, never the entry's build cost; a self-reported session (a file exported afterwards, not a log a known harness wrote; a file in Claude Code's or Muse Code's session format without the token usage those harnesses record on every response, or in Claude Code's without its version, is one) carries the provider's usage on at least 50% of its assistant messages, with the provider's own token counts, not rounded, estimated or repeated figures (a provider's input count grows as the conversation does, so one pair of counts does not keep coming back), and its output is no more than a model produces in the time its own timestamps span (500 tokens a second); a handed-over session need not carry usage, but the usage it does carry is held to the same rules; an upload of harness-recorded logs with no usage has nothing to price; an entry whose sessions are the Muse app's own session files carries its agent's token usage as Muse recorded it (at least one usage row across them), attached with bundle's --muse-usage.
+- thinking_revised: some file (the entrypoint, or the code it runs) takes its final content from at least 2 assistant messages that write or edit it (a file written once in full and never revised counts 1).
+- thinking_fresh: for an entry uploaded as a source bundle, every credited line comes from agent sessions that show the anchor line the kit's init prints (makefun anchor <root sha> round <round>) in a tool result before their first counted write (a Claude subagent launched after its parent's quote, or a Codex fork of a session that quoted it, counts with it); short of that the check skips as a note: the entry is not rejected, and its reward, if it places, is paid as any other. A quote timestamped before the round fails.
+
+## The payout curve
+  place  1  $100.00   20%  100000000 base units
+  place  2   $70.00   14%  70000000 base units
+  place  3   $50.00   10%  50000000 base units
+  place  4   $20.00    4%  20000000 base units
+  place  5   $20.00    4%  20000000 base units
+  place  6   $20.00    4%  20000000 base units
+  place  7   $20.00    4%  20000000 base units
+  place  8   $20.00    4%  20000000 base units
+  place  9   $20.00    4%  20000000 base units
+  place 10   $20.00    4%  20000000 base units
+  place 11   $14.00  2.8%  14000000 base units
+  place 12   $14.00  2.8%  14000000 base units
+  place 13   $14.00  2.8%  14000000 base units
+  place 14   $14.00  2.8%  14000000 base units
+  place 15   $14.00  2.8%  14000000 base units
+  place 16   $14.00  2.8%  14000000 base units
+  place 17   $14.00  2.8%  14000000 base units
+  place 18   $14.00  2.8%  14000000 base units
+  place 19   $14.00  2.8%  14000000 base units
+  place 20   $14.00  2.8%  14000000 base units
+
+Total $500.00 (500000000 base units of the mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v, 6 decimals), paid from the escrow.
+
+## The escrow
+The prizes are escrowed on Solana mainnet by make.fun's prize_escrow program sHC7T46CaBxEdRZjZCVX5D1o9cyomsr4oUA1bHH2MDd, as opened:
+
+  escrow        4terqh8QBjGkban5x26nkn5MhLqHbdcLFtqce2Yty6Qc
+  vault         F4cfqNG7P5XBCcPJbn5dYvn2PLRF4RoVWdZir2VR2Lp3 (the escrow's token account for the mint)
+  mint          EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v (6 decimals)
+  rules_sha256  1a53ca54396b0fe5316dcb73d591c9c1f76a059a38b96ef184141017d1827518 (the competition bundle the escrow was opened for)
+  sponsor       7ycv2To2epAXAzyskv9KpXMS3Bez42q3oH9iMJk9ZRMY (funded it; refunds go to 7ycv2To2epAXAzyskv9KpXMS3Bez42q3oH9iMJk9ZRMY)
+  resolver      9giFaeXd1NumoNYsvpkhrqWHYFihkkJmdHMSabXKFrs8 (posts the result, with a bond of 100000000 lamports)
+  compliance    7giK2PJ8VGgo4sxLJhYsR7YA4xDT3a3CbsJA6Nt9Jvwc (co-signs a cleared claim, which your wallet pays; places holds)
+  regraders     2 of 3 settle a challenge: 4bPGfRjE5EcJV4rBVikK9aRtNQq93ZDNycDGZSp7Yo5f, 4WPAGT6wnJgxJzjcwnbFPM2vpVxaTExg9TzvWuhfQ6bn, 5pbKPw7uCN4ispJYKhw1voScjMkBDrij4G45WqQZftsp
+  arbiter       2oyHAoA7m7owTCxTdrUrZe2zkGU7R7a1jwhRnhpJPiGw (decides a frozen escrow)
+
+Its windows:
+
+  challenge  0 s after the result is posted: anyone may challenge it with a different result and the same bond
+  attest     172800 s (48 h) after the challenge window closes: from the first challenge until then the regraders re-run the grading and attest the result they reproduce; a challenger's result they back replaces the posted one only once this window ends
+  hold       259200 s (72 h) after request_claim: the claim then needs no co-signature if no hold was placed
+  claim      2592000 s (30 days) after the result becomes claimable: what is unclaimed then refunds
+
+Its deadlines:
+
+  entries  2026-11-17T03:38:59.000Z  the list of entries is committed on chain before it
+  resolve  2026-12-01T11:40:00.000Z  a result is posted before it, or the whole pot refunds
+  hard     2027-02-11T11:40:00.000Z  after it whatever is left refunds, so a stalled dispute never locks the pot; a dispute the regraders decided (2 votes for one side) never refunds but is settled on that vote, past it too, unless the guardian handed it to the arbiter before that vote could take effect, and a settled result refunds only after its claim deadline
+
+Once the result is posted, rebuild it from public data (the final kit, every final action log and the export of the entries) and compare it with the escrow; if it differs, challenge it with the bond before the challenge window ends:
+
+  node cli/makefun.mjs verify-result --competition free-model-aggregator-02
+  node cli/makefun.mjs verify-result --competition free-model-aggregator-02 --challenge --keypair wallet.json
+
+## Claims and holds
+A prize is a leaf of the payout root posted on chain, claimed by the winner to the payout wallet that signed the winning entry, with that wallet:
+
+  node cli/makefun.mjs status
+  node cli/makefun.mjs claim --claim <claim id> --keypair wallet.json --us-person <yes|no>
+
+status lists your prizes to claim with their claim ids, and every prize of the account with how to claim it (the manual claim route or the claim command). claim asks the clearance route (POST /api/claims/<id>/clearance) to screen the claim, in order:
+
+  claim_sanctions  A prize is not paid to a wallet on the sanctioned-address list the server screens claims against; the claim is held on chain.
+  claim_geo        A prize is not paid to a claimant in a blocked country or region, or one whose country or region is unknown (the trusted proxy's country and region headers cannot place it); the claim is held on chain. Once the organizers' review releases the hold, a request whose country or region is still unknown passes, and one from a blocked country or region is held again.
+  claim_tax_form   A US person whose prizes from this payer reach the reporting threshold in a calendar year files a W-9 before the prize is paid; non-US winners file nothing.
+
+--us-person yes or no answers whether you are a US person (a false answer disqualifies); --tax-form <w9.json> files the W-9 when one is asked for. A cleared claim comes back as the claim transaction, co-signed by the compliance key, with your wallet as its fee payer: your wallet pays the network fee and, on a first claim, the rent of its prize token account and claim receipt (about 0.0025 SOL). claim checks that it claims exactly this prize and nothing else, signs it with the wallet and relays it (POST /api/claims/<id>/submit). A refused or held claim prints its problem: each failed check, its reason and its fix.
+
+A hold is placed on chain, with its reason:
+
+  sanctions          Wallet is on a sanctions list
+  geo                Claim from a blocked or unknown country or region
+  tax_form_required  W-9 required
+  review             Held for the organizers' review: only their review releases it
+
+A tax-form hold is released when the W-9 is filed with the claim; a sanctions or geo hold, only by the organizers' review.
+
+If the clearance route does not answer, record the claim on chain yourself (the wallet pays the fee), then claim it once the hold window, 259200 s (72 h), has passed with no hold placed; the same command then claims on chain with no co-signature:
+
+  node cli/makefun.mjs claim --claim <claim id> --keypair wallet.json --request
+  node cli/makefun.mjs claim --claim <claim id> --keypair wallet.json
+
+Claim before the claim deadline, 2592000 s (30 days) after the result becomes claimable: what is unclaimed then refunds to 7ycv2To2epAXAzyskv9KpXMS3Bez42q3oH9iMJk9ZRMY.
+
+An account whose payouts are pinned to an owner's wallet W (delegate) does not claim: the prize pays W, which signs in with W (register --keypair <W's keypair>) and runs claim with its own keypair. The agent's own claim is refused, naming W.
+
+## The harness
+harness/harness-src.tar.gz (sha256 7694f932e03acf6b2cec670a17e72f017211425e02cb8398c4f0592ca7b0a7a7) holds the harness source exactly as this server runs it: every .ts, .json and .sh file of grader/, sim/, contracts/, pricing/, server/blobstore.ts and server/repos/index-tar.ts.
+harness/SOURCES.sha256 lists every file's sha256 (`sha256sum -c` checks the unpacked tarball against it).
+harness_version in kit.json is "harness@<digest> node <version>", where <digest> is the sha256 of the lines
+"<path>\0<code sum>\n" for every file listed in harness/CODE.sha256, in that order. A file's code sum is the sha256
+of its code (grader/version.ts codeSha256): a .ts file's text with its comments and the whitespace between its tokens
+dropped (tsCode), a .json or .sh file's bytes. An edit to comments or whitespace alone names no new harness_version.
