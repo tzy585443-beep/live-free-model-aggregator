@@ -321,6 +321,103 @@ async function integration(briefPath, catalogText) {
   check(!hits.some((hit) => hit.model === "auto"), "auto was forwarded");
 }
 
+function spawnBot(briefPath, envUrl) {
+  return spawn("node", ["main.ts"], {
+    cwd: root,
+    env: {
+      ...process.env,
+      MAKEFUN_ENV_URL: envUrl,
+      MAKEFUN_PROMPT_FILE: briefPath,
+      OPENAI_BASE_URL: `${envUrl}/v1`,
+      OPENAI_API_KEY: "makefun-trial-dummy",
+      ANTHROPIC_API_KEY: "makefun-trial-dummy",
+    },
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+}
+
+function waitExit(child, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error(`${label}: the aggregator did not exit`));
+    }, ms);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+}
+
+/**
+ * The env answers POST /register only after it has called both /v1/models
+ * wires. The aggregator has to serve those GETs while its register fetch is
+ * still open.
+ */
+async function registerAfterProbe(briefPath) {
+  let done = false;
+  const probed = [];
+  const envServer = createServer(async (req, res) => {
+    if (req.url === "/register" && req.method === "POST") {
+      const raw = await readRequest(req);
+      const body = JSON.parse(raw);
+      const base = `http://127.0.0.1:${body.port}/v1/models`;
+      const openai = await fetch(base, { headers: { authorization: "Bearer client" }, signal: AbortSignal.timeout(5000) });
+      const anthropic = await fetch(base, { headers: { "x-api-key": "client", "anthropic-version": "2023-06-01" }, signal: AbortSignal.timeout(5000) });
+      probed.push((await openai.json()).data.length, (await anthropic.json()).data.length);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, requests: 6 }));
+      done = true;
+      return;
+    }
+    await readRequest(req);
+    if (req.url === "/work") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ done }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  const envPort = await listen(envServer);
+  const child = spawnBot(briefPath, `http://127.0.0.1:${envPort}`);
+  const code = await waitExit(child, 10000, "probe register");
+  envServer.close();
+  check(code === 0, `probe register exited ${code}`);
+  check(probed.length === 2 && probed[0] === 14 && probed[1] === 14, `models probed before register: ${probed.join(",")}`);
+}
+
+/** POST /register stays unanswered for 8s, longer than the old 5s abort. */
+async function registerAfterDelay(briefPath) {
+  let done = false;
+  const started = Date.now();
+  const envServer = createServer(async (req, res) => {
+    if (req.url === "/register" && req.method === "POST") {
+      await readRequest(req);
+      await new Promise((resolve) => setTimeout(resolve, 8000));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, requests: 6 }));
+      done = true;
+      return;
+    }
+    await readRequest(req);
+    if (req.url === "/work") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ done }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  const envPort = await listen(envServer);
+  const child = spawnBot(briefPath, `http://127.0.0.1:${envPort}`);
+  const code = await waitExit(child, 20000, "slow register");
+  const elapsed = Date.now() - started;
+  envServer.close();
+  check(code === 0, `slow register exited ${code}`);
+  check(elapsed >= 8000, `slow register finished in ${elapsed}ms`);
+}
+
 function practiceTable() {
   const path = "/tmp/makefun-kit/free-model-aggregator-02-kit/practice/trial-0/input/prompt.txt";
   let brief;
@@ -353,5 +450,7 @@ const briefPath = writeBrief(dir);
 unit(briefPath);
 const catalogText = runList(briefPath).stdout.slice(0, -1);
 await integration(briefPath, catalogText);
+await registerAfterProbe(briefPath);
+await registerAfterDelay(briefPath);
 practiceTable();
 console.log("selfcheck ok");
