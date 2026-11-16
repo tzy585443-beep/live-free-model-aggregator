@@ -31,6 +31,15 @@ import {
 const PROTOCOL_VERSION = 1;
 const POLL_MS = 100;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
+/**
+ * The env reads the register body, then calls GET /v1/models on the port we
+ * just named before it is obliged to finish the HTTP response. A short abort
+ * kills this process while that callback is still open, so the env never
+ * records the port. One attempt waits long enough for that probe and for a
+ * slow env, and stays inside the trial's 240s wall.
+ */
+const REGISTER_ATTEMPT_MS = 180_000;
+const REGISTER_BACKOFF_MS = [200, 400, 800, 1600, 2000];
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? "").replace(/\/+$/, "");
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? "";
@@ -255,19 +264,76 @@ function listen(server: Server): Promise<number> {
   });
 }
 
-async function register(port: number): Promise<void> {
-  const res = await fetch(`${ENV_URL}/register`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog }),
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!res.ok) {
-    throw new Error(`POST /register answered HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Prove the listener accepts both catalog wires before we name the port.
+ * The env's first action after reading the body is those two GETs.
+ */
+async function modelsAreServing(port: number): Promise<boolean> {
+  const url = `http://127.0.0.1:${port}/v1/models`;
+  try {
+    const openai = await fetch(url, {
+      headers: { authorization: "Bearer local" },
+      signal: AbortSignal.timeout(2000),
+    });
+    const anthropic = await fetch(url, {
+      headers: { "x-api-key": "local", "anthropic-version": "2023-06-01" },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!openai.ok || !anthropic.ok) return false;
+    const openaiBody: unknown = await openai.json();
+    const anthropicBody: unknown = await anthropic.json();
+    return isRecord(openaiBody) && Array.isArray(openaiBody.data) && isRecord(anthropicBody) && Array.isArray(anthropicBody.data);
+  } catch {
+    return false;
   }
-  const reply: unknown = await res.json();
-  const requests = isRecord(reply) && typeof reply.requests === "number" ? reply.requests : 0;
-  log(`registered on ${port} for ${requests} prompts, ${listedModels(brief).length} free models`);
+}
+
+async function waitUntilModelsServe(port: number): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (await modelsAreServing(port)) return;
+    await sleep(20);
+  }
+  log("local /v1/models was not ready; registering the port anyway");
+}
+
+/**
+ * POST /register until the env accepts the catalog. Connection failures and
+ * timeouts are retried. The process keeps serving while this runs, so a
+ * callback to /v1/models or a prompt that arrives early still gets an answer.
+ * The body is the same on every attempt.
+ */
+async function register(port: number): Promise<void> {
+  const body = JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog });
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const res = await fetch(`${ENV_URL}/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(REGISTER_ATTEMPT_MS),
+      });
+      const text = await res.text();
+      if (res.ok) {
+        let requests = 0;
+        try {
+          const reply: unknown = JSON.parse(text);
+          if (isRecord(reply) && typeof reply.requests === "number") requests = reply.requests;
+        } catch {
+          requests = 0;
+        }
+        log(`registered on ${port} for ${requests} prompts, ${listedModels(brief).length} free models`);
+        return;
+      }
+      log(`POST /register answered HTTP ${res.status}: ${text.slice(0, 300)}`);
+    } catch (err) {
+      log(`POST /register attempt ${attempt + 1} failed: ${(err as Error).message}`);
+    }
+    await sleep(REGISTER_BACKOFF_MS[Math.min(attempt, REGISTER_BACKOFF_MS.length - 1)] ?? 2000);
+  }
 }
 
 function pollUntilDone(server: Server): void {
@@ -277,7 +343,7 @@ function pollUntilDone(server: Server): void {
     busy = true;
     void (async () => {
       try {
-        const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
+        const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(10_000) });
         if (res.status !== 200) return;
         const work: unknown = await res.json();
         if (isRecord(work) && work.done === true) {
@@ -319,10 +385,13 @@ async function main(): Promise<void> {
   const port = await listen(server);
   if (port === 8080) throw new Error("refusing port 8080: the env listens there");
   log(`listening on 0.0.0.0:${port}`);
-  await register(port);
   process.on("SIGTERM", () => process.exit(0));
   process.on("SIGINT", () => process.exit(0));
+  // Poll before register returns. The env can finish a trial that it accepted
+  // on a connection this process has not read the response of yet.
   pollUntilDone(server);
+  await waitUntilModelsServe(port);
+  await register(port);
 }
 
 try {
